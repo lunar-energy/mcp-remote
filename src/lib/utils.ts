@@ -132,10 +132,12 @@ export function mcpProxy({
   transportToClient,
   transportToServer,
   ignoredTools = [],
+  onAuthRequired,
 }: {
   transportToClient: Transport
   transportToServer: Transport
   ignoredTools?: string[]
+  onAuthRequired?: () => Promise<void>
 }) {
   let transportToClientClosed = false
   let transportToServerClosed = false
@@ -201,7 +203,42 @@ export function mcpProxy({
       debugLog('Initialize message with modified client info', { clientInfo })
     }
 
-    transportToServer.send(message).catch(onServerError)
+    transportToServer.send(message).catch(async (error) => {
+      if (error instanceof UnauthorizedError && onAuthRequired) {
+        log('Re-authentication required — waiting for browser auth to complete...')
+        try {
+          await onAuthRequired()
+          // Retry after auth completes
+          transportToServer.send(message).catch((retryError) => {
+            onServerError(retryError)
+            if ('id' in message && message.id !== undefined) {
+              transportToClient
+                .send({
+                  jsonrpc: '2.0' as const,
+                  id: message.id,
+                  error: { code: -32603, message: retryError instanceof Error ? retryError.message : String(retryError) },
+                })
+                .catch(onClientError)
+            }
+          })
+          return
+        } catch (authError) {
+          onServerError(authError instanceof Error ? authError : new Error(String(authError)))
+        }
+      } else {
+        onServerError(error)
+      }
+      // For requests (has an id), send an error response back so the client doesn't hang
+      if ('id' in message && message.id !== undefined) {
+        transportToClient
+          .send({
+            jsonrpc: '2.0' as const,
+            id: message.id,
+            error: { code: -32603, message: error instanceof Error ? error.message : String(error) },
+          })
+          .catch(onClientError)
+      }
+    })
   }
 
   transportToServer.onmessage = (_message) => {
@@ -425,6 +462,15 @@ export async function connectToRemoteServer(
 
   // Create transport instance based on the strategy
   const sseTransport = transportStrategy === 'sse-only' || transportStrategy === 'sse-first'
+  const scopeEscalationFetch: typeof fetch = async (input, init) => {
+    const response = await fetch(input, init)
+    if (response.status === 403 && response.headers.get('WWW-Authenticate')?.includes('insufficient_scope')) {
+      log('Scope escalation needed — invalidating cached token to force re-auth with required scope')
+      await authProvider.invalidateCredentials('tokens')
+    }
+    return response
+  }
+
   const transport = sseTransport
     ? new SSEClientTransport(url, {
         authProvider,
@@ -434,6 +480,7 @@ export async function connectToRemoteServer(
     : new StreamableHTTPClientTransport(url, {
         authProvider,
         requestInit: { headers },
+        fetch: scopeEscalationFetch,
       })
 
   try {

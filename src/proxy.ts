@@ -11,6 +11,8 @@
 
 import { EventEmitter } from 'events'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import {
   connectToRemoteServer,
   log,
@@ -114,6 +116,18 @@ async function runProxy(
       transportToClient: localTransport,
       transportToServer: remoteTransport,
       ignoredTools,
+      onAuthRequired: async () => {
+        log('Waiting for browser re-authentication to complete...')
+        // Ensure the callback server is running — it may never have started if initial
+        // auth was skipped because cached tokens were already on disk.
+        const authState = await authCoordinator.initializeAuth()
+        server = authState.server
+        const code = await new Promise<string>((resolve) => events.once('auth-code-received', resolve))
+        if (remoteTransport instanceof SSEClientTransport || remoteTransport instanceof StreamableHTTPClientTransport) {
+          await remoteTransport.finishAuth(code)
+          log('Re-authentication completed successfully')
+        }
+      },
     })
 
     // Start the local STDIO server
